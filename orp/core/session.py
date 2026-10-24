@@ -11,6 +11,7 @@ reproduce one forward reentry run exactly:
 * the full entry state, every field explicit, with a mandatory ``frame`` tag,
 * the bank schedule's *source* (a constant value, explicit arrays, or a CSV path) plus a
   SHA-256 hash of the schedule's numerical content (independent of how it was sourced),
+* the built-in aerodynamic model and its parameters (custom strategies refused),
 * the integrator settings (time step, max simulation time, and the two termination
   bounds),
 * the provenance level of every component, recorded at save time.
@@ -74,7 +75,7 @@ __all__ = [
 ]
 
 #: The session-file format version (bump on incompatible schema changes).
-SESSION_FORMAT_VERSION = 1
+SESSION_FORMAT_VERSION = 2
 
 #: The only two legal values for the entry-state ``frame`` tag.
 FRAME_INERTIAL = "inertial"
@@ -91,6 +92,7 @@ _VALID_SOURCES: tuple[str, ...] = (SOURCE_CONSTANT, SOURCE_ARRAYS, SOURCE_CSV)
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
+
 
 class SessionError(Exception):
     """Base class for all session save/load failures."""
@@ -111,6 +113,7 @@ class SessionIntegrityError(SessionError):
 # ---------------------------------------------------------------------------
 # Hashing helpers
 # ---------------------------------------------------------------------------
+
 
 def _sha256_bytes(data: bytes) -> str:
     """Return the lowercase hex SHA-256 digest of ``data``."""
@@ -144,6 +147,7 @@ def _schedule_content_hash(schedule: BankSchedule) -> str:
 # Schedule source description (capture) and reconstruction (replay)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class _ScheduleSource:
     """A described bank-schedule source: how to write it down and how to rebuild it.
@@ -163,7 +167,9 @@ class _ScheduleSource:
     csv_path: str | None = None
 
 
-def _describe_constant(bank_angle_rad: float, *, duration: float = 0.0) -> _ScheduleSource:
+def _describe_constant(
+    bank_angle_rad: float, *, duration: float = 0.0
+) -> _ScheduleSource:
     """Describe a constant-bank schedule source (value in radians)."""
     return _ScheduleSource(
         kind=SOURCE_CONSTANT,
@@ -218,7 +224,9 @@ def _source_from_mapping(raw: Any) -> _ScheduleSource:
         return _ScheduleSource(
             kind=SOURCE_CONSTANT,
             constant_rad=float(_require(raw, "bank_angle_rad", "bank_schedule.source")),
-            constant_duration=float(_require(raw, "duration_s", "bank_schedule.source")),
+            constant_duration=float(
+                _require(raw, "duration_s", "bank_schedule.source")
+            ),
         )
     if kind == SOURCE_ARRAYS:
         times = _require(raw, "times_s", "bank_schedule.source")
@@ -229,7 +237,9 @@ def _source_from_mapping(raw: Any) -> _ScheduleSource:
             bank_angles_rad=tuple(float(a) for a in angles),
         )
     # SOURCE_CSV
-    return _ScheduleSource(kind=SOURCE_CSV, csv_path=str(_require(raw, "path", "bank_schedule.source")))
+    return _ScheduleSource(
+        kind=SOURCE_CSV, csv_path=str(_require(raw, "path", "bank_schedule.source"))
+    )
 
 
 def _reconstruct_schedule(
@@ -273,6 +283,7 @@ def _reconstruct_schedule(
 # Provenance (level only) serialisation — recorded as-is, never upgraded
 # ---------------------------------------------------------------------------
 
+
 def _provenance_levels(conditions: SimulationConditions) -> dict[str, str]:
     """Snapshot every component's provenance *level key*, exactly as it stands now.
 
@@ -289,9 +300,68 @@ def _provenance_levels(conditions: SimulationConditions) -> dict[str, str]:
     }
 
 
+def _finite_aero_number(block: dict, key: str) -> float:
+    try:
+        value = float(_require(block, key, "aerodynamics"))
+    except (TypeError, ValueError) as error:
+        raise SessionFormatError(f"Invalid aerodynamics.{key}") from error
+    if not math.isfinite(value):
+        raise SessionFormatError(f"aerodynamics.{key} must be finite")
+    return value
+
+
+def _aerodynamics_block(calculator: Any) -> dict[str, Any]:
+    from orp.core.aerodynamics.constant import ConstantCoefficientCalculator
+    from orp.core.aerodynamics.newtonian import ModifiedNewtonianCalculator
+
+    # Exact types: subclasses may add behavior this schema cannot reproduce.
+    if type(calculator) is ConstantCoefficientCalculator:
+        block = {
+            "kind": "constant",
+            "drag_coefficient": calculator.drag_coefficient,
+            "lift_to_drag": calculator.lift_to_drag,
+            "provenance": _provenance_block(calculator.provenance),
+        }
+    elif type(calculator) is ModifiedNewtonianCalculator:
+        block = {
+            "kind": "modified_newtonian",
+            "stall_angle": calculator.get_stall_angle(),
+        }
+    else:
+        raise SessionFormatError(
+            "Unsupported aerodynamic calculator; cannot record an exact replay"
+        )
+    _load_aerodynamics(block)  # Validate before writing any file.
+    return block
+
+
+def _load_aerodynamics(block: Any) -> Any:
+    from orp.core.aerodynamics.constant import ConstantCoefficientCalculator
+    from orp.core.aerodynamics.newtonian import ModifiedNewtonianCalculator
+
+    if not isinstance(block, dict):
+        raise SessionFormatError(
+            "Missing aerodynamics model; legacy sessions cannot identify it. Re-export from the original setup."
+        )
+    if block.get("kind") == "constant":
+        cd = _finite_aero_number(block, "drag_coefficient")
+        ld = _finite_aero_number(block, "lift_to_drag")
+        if cd <= 0:
+            raise SessionFormatError("aerodynamics.drag_coefficient must be positive")
+        return ConstantCoefficientCalculator(
+            cd, ld, provenance=_provenance_from_block(block.get("provenance"))
+        )
+    if block.get("kind") == "modified_newtonian":
+        return ModifiedNewtonianCalculator(_finite_aero_number(block, "stall_angle"))
+    raise SessionFormatError(
+        "Unknown aerodynamics.kind; refusing to substitute a model"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Small strict-access helpers
 # ---------------------------------------------------------------------------
+
 
 def _require(mapping: Any, key: str, where: str) -> Any:
     """Return ``mapping[key]`` or raise :class:`SessionFormatError` naming the path."""
@@ -303,6 +373,7 @@ def _require(mapping: Any, key: str, where: str) -> Any:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def save_session(
     path: str | Path,
@@ -341,7 +412,9 @@ def save_session(
     import yaml  # lazy: importing this module must not require PyYAML
 
     path = Path(path)
-    library = VehicleLibrary(Path(vehicle_data_dir) if vehicle_data_dir is not None else None)
+    library = VehicleLibrary(
+        Path(vehicle_data_dir) if vehicle_data_dir is not None else None
+    )
     vehicle_yaml = library.data_dir / f"{vehicle_name}.yaml"
     if not vehicle_yaml.is_file():
         available = ", ".join(library.list_available()) or "(none)"
@@ -400,12 +473,20 @@ def load_session(
     if not isinstance(document, dict):
         raise SessionFormatError(f"{path}: top-level session YAML must be a mapping.")
 
+    if document.get("format_version") != SESSION_FORMAT_VERSION:
+        raise SessionFormatError(
+            "Unsupported session version: aerodynamic replay requires version 2. Re-export from the original setup; do not guess the missing model."
+        )
+    aerodynamic_calculator = _load_aerodynamics(document.get("aerodynamics"))
+
     # --- vehicle: reload + verify YAML hash ---
     vehicle_block = _require(document, "vehicle", "session")
     vehicle_name = str(_require(vehicle_block, "name", "vehicle"))
     saved_vehicle_hash = str(_require(vehicle_block, "sha256", "vehicle"))
 
-    library = VehicleLibrary(Path(vehicle_data_dir) if vehicle_data_dir is not None else None)
+    library = VehicleLibrary(
+        Path(vehicle_data_dir) if vehicle_data_dir is not None else None
+    )
     vehicle_yaml = library.data_dir / f"{vehicle_name}.yaml"
     if not vehicle_yaml.is_file():
         available = ", ".join(library.list_available()) or "(none)"
@@ -450,10 +531,14 @@ def load_session(
 
     # --- bank schedule: rebuild from source + verify content hash ---
     schedule_block = _require(document, "bank_schedule", "session")
-    saved_schedule_hash = str(_require(schedule_block, "content_sha256", "bank_schedule"))
+    saved_schedule_hash = str(
+        _require(schedule_block, "content_sha256", "bank_schedule")
+    )
     schedule_prov = _provenance_from_block(schedule_block.get("provenance"))
     source = _source_from_mapping(_require(schedule_block, "source", "bank_schedule"))
-    schedule = _reconstruct_schedule(source, provenance=schedule_prov, base_dir=path.parent)
+    schedule = _reconstruct_schedule(
+        source, provenance=schedule_prov, base_dir=path.parent
+    )
     current_schedule_hash = _schedule_content_hash(schedule)
     if current_schedule_hash != saved_schedule_hash:
         raise SessionIntegrityError(
@@ -470,8 +555,11 @@ def load_session(
         vehicle=vehicle,
         planet=planet,
         bank_schedule=schedule,
+        aerodynamic_calculator=aerodynamic_calculator,
         entry_velocity=float(_require(entry, "entry_velocity", "entry_state")),
-        entry_flight_path_angle=float(_require(entry, "entry_flight_path_angle", "entry_state")),
+        entry_flight_path_angle=float(
+            _require(entry, "entry_flight_path_angle", "entry_state")
+        ),
         entry_altitude=float(_require(entry, "entry_altitude", "entry_state")),
         entry_heading=float(_require(entry, "entry_heading", "entry_state")),
         entry_latitude=float(_require(entry, "entry_latitude", "entry_state")),
@@ -487,6 +575,7 @@ def load_session(
 # ---------------------------------------------------------------------------
 # Public source-description constructors (the supported schedule source kinds)
 # ---------------------------------------------------------------------------
+
 
 def source_constant(bank_angle_rad: float, *, duration: float = 0.0) -> _ScheduleSource:
     """A constant-bank schedule source (radians). See :class:`BankSchedule.constant`."""
@@ -506,6 +595,7 @@ def source_csv(path: str | Path) -> _ScheduleSource:
 # ---------------------------------------------------------------------------
 # Document assembly / provenance block helpers
 # ---------------------------------------------------------------------------
+
 
 def _build_document(
     *,
@@ -527,6 +617,7 @@ def _build_document(
             "name": conditions.planet.name,
             "provenance": _provenance_block(conditions.planet.provenance),
         },
+        "aerodynamics": _aerodynamics_block(conditions.aerodynamic_calculator),
         "entry_state": {
             # Mandatory frame tag. ORP's entry velocity is planet-relative.
             "frame": FRAME_PLANET_RELATIVE,
@@ -568,13 +659,24 @@ def _provenance_from_block(raw: Any) -> ProvenanceTag:
     if not isinstance(raw, dict):
         return ProvenanceTag(ValidationLevel.NOT_VALIDATED)
     level = ValidationLevel.from_string(str(raw.get("level", "not_validated")))
-    return ProvenanceTag(level=level, source=str(raw.get("source", "")), notes=str(raw.get("notes", "")))
+    return ProvenanceTag(
+        level=level, source=str(raw.get("source", "")), notes=str(raw.get("notes", ""))
+    )
 
 
 # Public aliases for the source constructors and the (private) dataclass, so callers and
 # tests can name them without reaching through the underscore-prefixed implementation.
 ScheduleSource = _ScheduleSource
 
-__all__ += ["source_constant", "source_arrays", "source_csv", "ScheduleSource",
-            "SESSION_FORMAT_VERSION", "FRAME_INERTIAL", "FRAME_PLANET_RELATIVE",
-            "SOURCE_CONSTANT", "SOURCE_ARRAYS", "SOURCE_CSV"]
+__all__ += [
+    "source_constant",
+    "source_arrays",
+    "source_csv",
+    "ScheduleSource",
+    "SESSION_FORMAT_VERSION",
+    "FRAME_INERTIAL",
+    "FRAME_PLANET_RELATIVE",
+    "SOURCE_CONSTANT",
+    "SOURCE_ARRAYS",
+    "SOURCE_CSV",
+]
