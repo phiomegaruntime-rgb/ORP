@@ -94,10 +94,17 @@ deliberately blank) and is loaded by its dedicated loader,
 refuses it, so a two-column hold-last extract is the way to replay it through
 `--bank-csv` (see `orp/tests/test_bank_schedule_from_csv.py` for the exact recipe).
 
-Documented limitation: reloading `session.yaml` with `load_session` and re-running
-`SimulationEngine` does not yet reproduce the CLI trajectory, because the session
-schema does not record the aerodynamic-calculator choice (the CLI runs constant
-vehicle coefficients; the reloaded session falls back to the engine default).
+Session format 2 records the built-in aerodynamic calculator and its parameters,
+including constant-coefficient provenance, so CLI sessions restore the constant
+vehicle coefficients instead of falling back to the engine default. Custom
+calculator strategies are refused rather than silently substituted.
+
+Format-1 sessions do not identify the aerodynamic model and are refused. Re-export
+from the original setup; changing the version number alone cannot recover the
+missing model. Replay tests cover the built-in Earth/Apollo and Mars/MSL paths in
+the same environment. Sessions do not serialize custom planet/vehicle/integrator
+implementations or guarantee replay across code versions. This is numerical
+reproducibility, not flight validation.
 
 ## Three non-negotiable principles
 
